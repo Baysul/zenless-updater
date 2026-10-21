@@ -1,0 +1,205 @@
+diff --git a/dlls/ntoskrnl.exe/ntoskrnl.c b/dlls/ntoskrnl.exe/ntoskrnl.c
+index b4058c0..1654950 100644
+--- a/dlls/ntoskrnl.exe/ntoskrnl.c
++++ b/dlls/ntoskrnl.exe/ntoskrnl.c
+@@ -36,6 +36,20 @@ WINE_DEFAULT_DEBUG_CHANNEL(ntoskrnl);
+ WINE_DECLARE_DEBUG_CHANNEL(relay);
+ 
+ BOOLEAN KdDebuggerEnabled = FALSE;
++BOOLEAN KdDebuggerNotPresent = TRUE;
++
++/* Kernel address-space boundaries.  Windows keeps the kernel mapped above
++ * 0xffff800000000000 on x86-64 and above 0x80000000 on i386; drivers read these
++ * variables directly (they are data exports, not functions). */
++#ifdef _WIN64
++PVOID MmSystemRangeStart = (PVOID)0xffff800000000000ULL;
++PVOID MmHighestUserAddress = (PVOID)0x00007ffffffe0000ULL;
++PVOID MmUserProbeAddress = (PVOID)0x00007ffffffe0000ULL;
++#else
++PVOID MmSystemRangeStart = (PVOID)0x80000000UL;
++PVOID MmHighestUserAddress = (PVOID)0x7fff0000UL;
++PVOID MmUserProbeAddress = (PVOID)0x7fff0000UL;
++#endif
+ ULONG InitSafeBootMode = 0;
+ USHORT NtBuildNumber = 0;
+ 
+@@ -3928,6 +3942,26 @@ NTSTATUS WINAPI IoUnregisterPlugPlayNotification(PVOID notification)
+     return STATUS_SUCCESS;
+ }
+ 
++/*****************************************************
++ *           IoUnregisterPlugPlayNotificationEx    (NTOSKRNL.EXE.@)
++ */
++NTSTATUS WINAPI IoUnregisterPlugPlayNotificationEx( PVOID notification )
++{
++    TRACE( "(%p)\n", notification );
++    return IoUnregisterPlugPlayNotification( notification );
++}
++
++/*****************************************************
++ *           KeQueryPrcbAddress    (NTOSKRNL.EXE.@)
++ */
++PVOID WINAPI KeQueryPrcbAddress( ULONG number )
++{
++    static BYTE prcb[64][0x800];
++
++    FIXME( "(%lu) semi-stub\n", number );
++    return prcb[number % 64];
++}
++
+ /*****************************************************
+  *           IoCsqInitialize  (NTOSKRNL.EXE.@)
+  */
+diff --git a/dlls/ntoskrnl.exe/ntoskrnl.exe.spec b/dlls/ntoskrnl.exe/ntoskrnl.exe.spec
+index 785f511..5b034fb 100644
+--- a/dlls/ntoskrnl.exe/ntoskrnl.exe.spec
++++ b/dlls/ntoskrnl.exe/ntoskrnl.exe.spec
+@@ -14,6 +14,7 @@
+ @ stdcall -arch=!i386 ExReleaseFastMutex(ptr)
+ @ stdcall -fastcall ExReleaseFastMutexUnsafe(ptr)
+ @ stdcall -fastcall ExReleaseResourceLite(ptr)
++@ stdcall ExReleaseResourceAndLeaveCriticalRegion(ptr)
+ @ stub ExReleaseRundownProtection
+ @ stub ExReleaseRundownProtectionEx
+ @ stub ExRundownCompleted
+@@ -135,6 +136,8 @@
+ @ stub DbgSetDebugFilterState
+ @ stdcall ExAcquireResourceExclusiveLite(ptr long)
+ @ stdcall ExAcquireResourceSharedLite(ptr long)
++@ stdcall ExEnterCriticalRegionAndAcquireResourceExclusive(ptr)
++@ stdcall ExEnterCriticalRegionAndAcquireResourceShared(ptr)
+ @ stdcall ExAcquireSharedStarveExclusive(ptr long)
+ @ stdcall ExAcquireSharedWaitForExclusive(ptr long)
+ @ stub ExAllocateFromPagedLookasideList
+@@ -501,6 +504,7 @@
+ @ stdcall IoUnregisterFileSystem(ptr)
+ @ stub IoUnregisterFsRegistrationChange
+ @ stdcall IoUnregisterPlugPlayNotification(ptr)
++@ stdcall IoUnregisterPlugPlayNotificationEx(ptr)
+ @ stdcall IoUnregisterShutdownNotification(ptr)
+ @ stub IoUpdateShareAccess
+ @ stub IoValidateDeviceIoControlAccess
+@@ -528,7 +532,7 @@
+ @ stub IoWriteTransferCount
+ @ stdcall KdChangeOption(long long ptr long ptr ptr)
+ @ extern KdDebuggerEnabled
+-@ stub KdDebuggerNotPresent
++@ extern KdDebuggerNotPresent
+ @ stdcall KdDisableDebugger()
+ @ stdcall KdEnableDebugger()
+ @ stub KdEnteredDebugger
+@@ -542,6 +546,7 @@
+ @ stub KeAcquireInterruptSpinLock
+ @ stdcall KeAcquireSpinLockAtDpcLevel(ptr)
+ @ stdcall -arch=!i386 KeAcquireSpinLockRaiseToDpc(ptr)
++@ stdcall KeAcquireQueuedSpinLock(ptr)
+ @ stub KeAddSystemServiceTable
+ @ stdcall KeAlertThread(ptr long)
+ @ stdcall KeAreAllApcsDisabled()
+@@ -621,6 +626,7 @@
+ @ stdcall KeQuerySystemTime(ptr)
+ @ stdcall KeQueryTickCount(ptr)
+ @ stdcall KeQueryTimeIncrement()
++@ stdcall KeQueryPrcbAddress(long)
+ @ stdcall KeQueryMaximumGroupCount() GetMaximumProcessorGroupCount
+ @ stdcall KeQueryMaximumProcessorCountEx(long)
+ @ stdcall KeQueryMaximumProcessorCount()
+@@ -638,6 +644,7 @@
+ @ stdcall KeReleaseMutex(ptr long)
+ @ stdcall KeReleaseSemaphore(ptr long long long)
+ @ stdcall -arch=!i386 KeReleaseSpinLock(ptr long)
++@ stdcall KeReleaseQueuedSpinLock(ptr long)
+ @ stdcall KeReleaseSpinLockFromDpcLevel(ptr)
+ @ stub KeRemoveByKeyDeviceQueue
+ @ stub KeRemoveByKeyDeviceQueueIfBusy
+@@ -733,7 +740,7 @@
+ @ stdcall MmGetSystemRoutineAddress(ptr)
+ @ stdcall MmGetVirtualForPhysical(int64)
+ @ stub MmGrowKernelStack
+-@ stub MmHighestUserAddress
++@ extern MmHighestUserAddress
+ @ stdcall MmIsAddressValid(ptr)
+ @ stub MmIsDriverVerifying
+ @ stub MmIsNonPagedSystemAddressValid
+@@ -769,7 +776,7 @@
+ @ stub MmSetAddressRangeModified
+ @ stub MmSetBankedSection
+ @ stub MmSizeOfMdl
+-@ stub MmSystemRangeStart
++@ extern MmSystemRangeStart
+ @ stub MmTrimAllSystemPagableMemory
+ @ stdcall MmUnlockPagableImageSection(ptr)
+ @ stdcall MmUnlockPages(ptr)
+@@ -781,7 +788,7 @@
+ @ stub MmUnmapViewInSystemSpace
+ @ stub MmUnmapViewOfSection
+ @ stub MmUnsecureVirtualMemory
+-@ stub MmUserProbeAddress
++@ extern MmUserProbeAddress
+ @ extern NlsAnsiCodePage ntdll.NlsAnsiCodePage
+ @ stub NlsLeadByteInfo
+ @ extern NlsMbCodePageTag ntdll.NlsMbCodePageTag
+diff --git a/dlls/ntoskrnl.exe/sync.c b/dlls/ntoskrnl.exe/sync.c
+index 6cc29c5..da0c9c2 100644
+--- a/dlls/ntoskrnl.exe/sync.c
++++ b/dlls/ntoskrnl.exe/sync.c
+@@ -1489,3 +1489,59 @@ KDEVICE_QUEUE_ENTRY *WINAPI KeRemoveDeviceQueue( KDEVICE_QUEUE *queue )
+ 
+     return entry;
+ }
++
++/***********************************************************************
++ *           ExEnterCriticalRegionAndAcquireResourceShared  (NTOSKRNL.EXE.@)
++ */
++PVOID WINAPI ExEnterCriticalRegionAndAcquireResourceShared( ERESOURCE *resource )
++{
++    TRACE( "resource %p.\n", resource );
++
++    KeEnterCriticalRegion();
++    ExAcquireResourceSharedLite( resource, TRUE );
++    return NULL;
++}
++
++/***********************************************************************
++ *           ExEnterCriticalRegionAndAcquireResourceExclusive  (NTOSKRNL.EXE.@)
++ */
++PVOID WINAPI ExEnterCriticalRegionAndAcquireResourceExclusive( ERESOURCE *resource )
++{
++    TRACE( "resource %p.\n", resource );
++
++    KeEnterCriticalRegion();
++    ExAcquireResourceExclusiveLite( resource, TRUE );
++    return NULL;
++}
++
++/***********************************************************************
++ *           ExReleaseResourceAndLeaveCriticalRegion  (NTOSKRNL.EXE.@)
++ */
++void WINAPI ExReleaseResourceAndLeaveCriticalRegion( ERESOURCE *resource )
++{
++    TRACE( "resource %p.\n", resource );
++
++    ExReleaseResourceLite( resource );
++    KeLeaveCriticalRegion();
++}
++
++/***********************************************************************
++ *           KeAcquireQueuedSpinLock  (NTOSKRNL.EXE.@)
++ */
++KIRQL WINAPI KeAcquireQueuedSpinLock( KSPIN_LOCK_QUEUE *queue )
++{
++    TRACE( "queue %p.\n", queue );
++
++    if (queue && queue->Lock) KeAcquireSpinLockAtDpcLevel( queue->Lock );
++    return 0;
++}
++
++/***********************************************************************
++ *           KeReleaseQueuedSpinLock  (NTOSKRNL.EXE.@)
++ */
++void WINAPI KeReleaseQueuedSpinLock( KSPIN_LOCK_QUEUE *queue, KIRQL irql )
++{
++    TRACE( "queue %p, irql %u.\n", queue, irql );
++
++    if (queue && queue->Lock) KeReleaseSpinLockFromDpcLevel( queue->Lock );
++}
