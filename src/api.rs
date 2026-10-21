@@ -1,9 +1,14 @@
-use crate::manifest::{Branch, Download, Entry, Manifest, Package, valid_hash, validate_entries};
+use crate::{
+    cancelled,
+    manifest::{Branch, Chunk, Download, Entry, Manifest, Package, valid_hash, validate_entries},
+    transfer::{self, Resources},
+};
 use anyhow::{Context, Result, ensure};
 use prost::Message;
 use reqwest::{Url, blocking::Client};
 use serde::{Deserialize, de::DeserializeOwned};
 use std::{
+    fs::File,
     io::{Cursor, Read},
     time::Duration,
 };
@@ -88,21 +93,28 @@ impl Api {
             branch.name == "main",
             "Official API returned a non-release branch"
         );
+        let build = self.build_at(&branch, &branch.tag)?;
+        Ok((branch, build))
+    }
+
+    /// Older official layouts enable reuse even when chunks moved within a file.
+    /// The service may have expired a release; callers must retain a safe fallback.
+    pub fn build_at(&self, branch: &Branch, tag: &str) -> Result<Build> {
         let build: Build = self.json(
             BUILD,
             &[
                 ("package_id", &branch.package_id),
                 ("password", &branch.password),
                 ("branch", &branch.name),
-                ("tag", &branch.tag),
+                ("tag", tag),
                 ("plat_app", "ddxf6vlr1reo"),
             ],
         )?;
         ensure!(
-            build.tag == branch.tag,
+            build.tag == tag,
             "Branch/build version disagreement; retry later"
         );
-        Ok((branch, build))
+        Ok(build)
     }
 
     pub fn bytes(
@@ -114,40 +126,18 @@ impl Api {
         decoded_hash: &str,
         compressed_hash: &str,
     ) -> Result<Vec<u8>> {
-        ensure!(
-            download.encryption == 0,
-            "Encrypted Sophon downloads are not supported"
-        );
-        ensure!(
-            download.compression <= 1,
-            "Unknown Sophon compression {}",
-            download.compression
-        );
         ensure!(valid_hash(decoded_hash), "Invalid download checksum");
-        let mut url = Url::parse(&download.url_prefix)?;
-        let host = url.host_str().context("CDN URL has no host")?;
-        ensure!(
-            url.scheme() == "https"
-                && ["zenlesszonezero.com", "hoyoverse.com", "mihoyo.com"]
-                    .iter()
-                    .any(|suffix| host == *suffix || host.ends_with(&format!(".{suffix}"))),
-            "Non-official CDN URL refused"
-        );
-        ensure!(
-            url.username().is_empty() && url.password().is_none() && url.port().is_none(),
-            "Invalid CDN authority"
-        );
-        url.path_segments_mut()
-            .map_err(|()| anyhow::anyhow!("Invalid CDN URL"))?
-            .pop_if_empty()
-            .push(name);
-        if !download.url_suffix.is_empty() {
-            url.set_query(Some(&download.url_suffix));
-        }
+        let url = download_url(download, name)?;
         let mut last = None;
         for _ in 0..3 {
+            cancelled()?;
             let result = (|| -> Result<Vec<u8>> {
                 let response = self.client.get(url.clone()).send()?.error_for_status()?;
+                ensure!(
+                    response.status() == reqwest::StatusCode::OK,
+                    "Unexpected download status: {}",
+                    response.status()
+                );
                 let compressed = read_bounded(response, compressed_size)?;
                 ensure!(
                     compressed.len() as u64 == compressed_size,
@@ -178,6 +168,54 @@ impl Api {
         }
         Err(last.context("Download failed")?)
             .with_context(|| format!("Downloading {name} after 3 attempts"))
+    }
+
+    /// Bounded, verified writes directly to the unpublished staging file. A retry
+    /// overwrites the entire chunk, never accepting a speculative partial prefix.
+    pub fn stream_chunk(
+        &self,
+        download: &Download,
+        chunk: &Chunk,
+        target: &File,
+        resources: &Resources,
+        buffer: &mut [u8],
+    ) -> Result<()> {
+        ensure!(valid_hash(&chunk.hash), "Invalid download checksum");
+        let url = download_url(download, &chunk.name)?;
+        let _memory = resources.transfer_memory(chunk, download.compression == 1)?;
+        let mut last = None;
+        for _ in 0..3 {
+            cancelled()?;
+            let result = (|| -> Result<()> {
+                let _network = resources.network()?;
+                let response = self.client.get(url.clone()).send()?.error_for_status()?;
+                ensure!(
+                    response.status() == reqwest::StatusCode::OK,
+                    "Unexpected download status: {}",
+                    response.status()
+                );
+                if let Some(size) = response.content_length() {
+                    ensure!(
+                        size == u64::try_from(chunk.size)?,
+                        "Compressed download size mismatch"
+                    );
+                }
+                transfer::stream(
+                    response,
+                    chunk,
+                    download.compression,
+                    target,
+                    resources,
+                    buffer,
+                )
+            })();
+            match result {
+                Ok(()) => return Ok(()),
+                Err(error) => last = Some(error),
+            }
+        }
+        Err(last.context("Download failed")?)
+            .with_context(|| format!("Downloading {} after 3 attempts", chunk.name))
     }
 
     fn package_entries(&self, package: &Package) -> Result<Vec<Entry>> {
@@ -233,6 +271,39 @@ impl Api {
         validate_entries(&mut entries)?;
         Ok(entries)
     }
+}
+
+fn download_url(download: &Download, name: &str) -> Result<Url> {
+    ensure!(
+        download.encryption == 0,
+        "Encrypted Sophon downloads are not supported"
+    );
+    ensure!(
+        download.compression <= 1,
+        "Unknown Sophon compression {}",
+        download.compression
+    );
+    let mut url = Url::parse(&download.url_prefix)?;
+    let host = url.host_str().context("CDN URL has no host")?;
+    ensure!(
+        url.scheme() == "https"
+            && ["zenlesszonezero.com", "hoyoverse.com", "mihoyo.com"]
+                .iter()
+                .any(|suffix| host == *suffix || host.ends_with(&format!(".{suffix}"))),
+        "Non-official CDN URL refused"
+    );
+    ensure!(
+        url.username().is_empty() && url.password().is_none() && url.port().is_none(),
+        "Invalid CDN authority"
+    );
+    url.path_segments_mut()
+        .map_err(|()| anyhow::anyhow!("Invalid CDN URL"))?
+        .pop_if_empty()
+        .push(name);
+    if !download.url_suffix.is_empty() {
+        url.set_query(Some(&download.url_suffix));
+    }
+    Ok(url)
 }
 
 fn read_bounded(reader: impl Read, limit: u64) -> Result<Vec<u8>> {

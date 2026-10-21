@@ -1,6 +1,8 @@
 mod api;
 mod files;
+mod installed;
 mod manifest;
+mod transfer;
 mod updater;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -33,7 +35,7 @@ pub(crate) fn cancelled() -> Result<()> {
 struct Args {
     #[arg(short = 'd', long, global = true, value_name = "DIR")]
     game_dir: Option<PathBuf>,
-    /// Parallel file checks/downloads (1-32)
+    /// Parallel file checks and chunk transfers (1-32)
     #[arg(short = 'j', long, global = true, default_value_t = 4, value_parser = clap::value_parser!(u8).range(1..=32))]
     jobs: u8,
     /// Include every optional resource category, not just base + installed categories
@@ -180,13 +182,24 @@ fn run() -> Result<u8> {
     let (branch, build) = api.latest()?;
     let (packages, entries, restored) =
         load_entries(&pool, &api, &root, build, &branch.categories, &args, repair)?;
-    let voice_packs: Vec<_> = packages
-        .iter()
-        .filter(|p| ["en-us", "ja-jp", "ko-kr", "zh-cn"].contains(&p.matching_field.as_str()))
-        .map(|p| p.matching_field.as_str())
-        .collect();
+    let installed = load_installed(
+        &pool,
+        &api,
+        &root,
+        &branch,
+        &packages,
+        local.version.as_deref(),
+    )?;
+    let voice_packs = selected_voices(&packages);
     announce(args.json, &local, &branch.tag, packages.len(), &voice_packs);
-    let plan = pool.install(|| updater::scan(&root, entries, args.json))?;
+    let plan = pool.install(|| {
+        updater::scan(
+            &root,
+            entries,
+            installed.as_ref().map(|s| s.assets.as_slice()),
+            args.json,
+        )
+    })?;
     let needs_update = local.version.as_deref() != Some(branch.tag.as_str())
         || !plan.changed.is_empty()
         || !local.problems.is_empty();
@@ -222,22 +235,42 @@ fn run() -> Result<u8> {
         return Ok(if needs_update { 2 } else { 0 });
     }
     if !needs_update {
-        if repair {
-            eprintln!(
-                "Nothing to repair; the installation already matches {}.",
-                branch.tag
-            );
-        } else {
-            eprintln!("Up to date; no changes needed.");
-        }
+        record_current(&root, &branch.tag, &packages, &plan.entries, repair);
         return Ok(0);
     }
     let yes = matches!(
         args.command,
         Some(Command::Update { yes: true } | Command::Repair { yes: true })
     );
-    commit(&api, &pool, &root, &plan, &branch.tag, repair, yes)?;
+    let release = Release {
+        target: installed::Snapshot::new(&branch.tag, &packages, &plan.entries),
+        installed,
+    };
+    commit(&api, &pool, &root, &plan, &release, repair, yes)?;
     Ok(0)
+}
+
+fn selected_voices(packages: &[manifest::Package]) -> Vec<&str> {
+    packages
+        .iter()
+        .filter(|p| ["en-us", "ja-jp", "ko-kr", "zh-cn"].contains(&p.matching_field.as_str()))
+        .map(|p| p.matching_field.as_str())
+        .collect()
+}
+
+fn record_current(
+    root: &Path,
+    tag: &str,
+    packages: &[manifest::Package],
+    entries: &[manifest::Entry],
+    repair: bool,
+) {
+    installed::remember(root, &installed::Snapshot::new(tag, packages, entries));
+    if repair {
+        eprintln!("Nothing to repair; the installation already matches {tag}.");
+    } else {
+        eprintln!("Up to date; no changes needed.");
+    }
 }
 
 fn announce(json: bool, local: &LocalState, tag: &str, manifests: usize, voice_packs: &[&str]) {
@@ -259,12 +292,17 @@ fn announce(json: bool, local: &LocalState, tag: &str, manifests: usize, voice_p
     eprintln!("Loading manifests, then verifying local files and reusable chunks…");
 }
 
+struct Release {
+    target: installed::Snapshot,
+    installed: Option<installed::Snapshot>,
+}
+
 fn commit(
     api: &api::Api,
     pool: &rayon::ThreadPool,
     root: &Path,
     plan: &updater::Plan,
-    tag: &str,
+    release: &Release,
     repair: bool,
     yes: bool,
 ) -> Result<()> {
@@ -273,7 +311,12 @@ fn commit(
         return Ok(());
     }
     ensure_game_closed()?;
+    if let Some(installed) = &release.installed {
+        installed::remember(root, installed);
+    }
+    let tag = &release.target.version;
     pool.install(|| updater::apply(api, root, plan, tag, false))?;
+    installed::remember(root, &release.target);
     if repair {
         eprintln!(
             "Repaired and verified {} files for {tag}. Launch the game with your existing Wine/Proton setup.",
@@ -285,6 +328,53 @@ fn commit(
         );
     }
     Ok(())
+}
+
+/// Optional old layouts only identify candidate offsets. Scan and apply still hash
+/// the local bytes, and expired/unavailable official releases do not block updates.
+fn load_installed(
+    pool: &rayon::ThreadPool,
+    api: &api::Api,
+    root: &Path,
+    branch: &manifest::Branch,
+    packages: &[manifest::Package],
+    version: Option<&str>,
+) -> Result<Option<installed::Snapshot>> {
+    let Some(version) = version else {
+        return Ok(None);
+    };
+    match installed::load(root, version) {
+        Ok(Some(snapshot)) => return Ok(Some(snapshot)),
+        Ok(None) => (),
+        Err(error) => eprintln!("warning: ignoring installed manifest cache: {error:#}"),
+    }
+    if version == branch.tag {
+        return Ok(None);
+    }
+    let fetched = (|| -> Result<installed::Snapshot> {
+        let old = api.build_at(branch, version)?;
+        let packages: Vec<_> = old
+            .manifests
+            .into_iter()
+            .filter(|old| {
+                packages
+                    .iter()
+                    .any(|new| new.matching_field == old.matching_field)
+            })
+            .collect();
+        let entries = pool.install(|| api.entries(&packages))?;
+        Ok(installed::Snapshot::new(version, &packages, &entries))
+    })();
+    match fetched {
+        Ok(snapshot) => Ok(Some(snapshot)),
+        Err(error) => {
+            crate::cancelled()?;
+            eprintln!(
+                "warning: installed-release layout unavailable; using target-offset reuse: {error:#}"
+            );
+            Ok(None)
+        }
+    }
 }
 
 fn load_entries(

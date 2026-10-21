@@ -2,11 +2,93 @@ use crate::{cancelled, manifest::relative_path};
 use anyhow::{Context, Result, ensure};
 use std::{
     fs::{self, File, Metadata, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
+    io::{Read, Write},
+    os::unix::fs::{FileExt, MetadataExt},
     path::{Path, PathBuf},
 };
 
 pub const STATE: &str = ".zenless-updater";
+pub const CHUNK_BUFFER: usize = 64 * 1024;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct FileIdentity {
+    device: u64,
+    inode: u64,
+    length: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+
+impl FileIdentity {
+    pub fn of(file: &File) -> Result<Self> {
+        let meta = file.metadata()?;
+        ensure!(meta.is_file(), "Expected a regular file");
+        Ok(Self {
+            device: meta.dev(),
+            inode: meta.ino(),
+            length: meta.len(),
+            modified: (meta.mtime(), meta.mtime_nsec()),
+            changed: (meta.ctime(), meta.ctime_nsec()),
+        })
+    }
+
+    pub fn same_file(self, other: Self) -> bool {
+        self.device == other.device && self.inode == other.inode && self.length == other.length
+    }
+}
+
+pub fn identity(file: Option<&File>) -> Result<Option<FileIdentity>> {
+    file.map(FileIdentity::of).transpose()
+}
+
+/// Creation must be exclusive: an existence check cannot distinguish a fresh stage safely.
+pub fn open_stage(path: &Path) -> Result<(File, bool)> {
+    match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(file) => Ok((file, true)),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            ensure!(metadata(path)?.is_some(), "Staging file disappeared");
+            Ok((OpenOptions::new().read(true).write(true).open(path)?, false))
+        }
+        Err(error) => Err(error).with_context(|| format!("Opening stage {}", path.display())),
+    }
+}
+
+/// Verify a range without allocating a complete decoded chunk or moving a shared cursor.
+pub fn matches_chunk(
+    file: Option<&File>,
+    offset: i64,
+    size: i64,
+    hash: &str,
+    buffer: &mut [u8],
+) -> Result<bool> {
+    cancelled()?;
+    let Some(file) = file else { return Ok(false) };
+    let offset = u64::try_from(offset).context("Negative chunk offset")?;
+    let size = u64::try_from(size).context("Negative chunk size")?;
+    let end = offset.checked_add(size).context("Chunk offset overflow")?;
+    if file.metadata()?.len() < end {
+        return Ok(false);
+    }
+    let mut position = offset;
+    let mut digest = md5::Context::new();
+    while position < end {
+        cancelled()?;
+        let count = usize::try_from((end - position).min(buffer.len() as u64))?;
+        match file.read_exact_at(&mut buffer[..count], position) {
+            Ok(()) => (),
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(false),
+            Err(error) => return Err(error).context("Reading reusable chunk"),
+        }
+        digest.consume(&buffer[..count]);
+        position += count as u64;
+    }
+    Ok(format!("{:x}", digest.finalize()).eq_ignore_ascii_case(hash))
+}
 
 // Refuse symlinks in every existing component, including the final file.
 // The game directory must not be writable by an untrusted concurrent process.
@@ -81,30 +163,6 @@ pub fn matches_file(path: &Path, size: i64, hash: &str) -> Result<bool> {
         Some(meta) if meta.len() == size => hash_file(path)?.eq_ignore_ascii_case(hash),
         _ => false,
     })
-}
-
-pub fn read_chunk(
-    file: &mut Option<File>,
-    offset: i64,
-    size: i64,
-    hash: &str,
-) -> Result<Option<Vec<u8>>> {
-    cancelled()?;
-    let Some(file) = file else { return Ok(None) };
-    let offset = u64::try_from(offset).context("Negative chunk offset")?;
-    let size = u64::try_from(size).context("Negative chunk size")?;
-    let end = offset.checked_add(size).context("Chunk offset overflow")?;
-    if file.metadata()?.len() < end {
-        return Ok(None);
-    }
-    file.seek(SeekFrom::Start(offset))?;
-    let mut bytes = vec![0u8; usize::try_from(size).context("Chunk size exceeds address space")?];
-    file.read_exact(&mut bytes)?;
-    if format!("{:x}", md5::compute(&bytes)).eq_ignore_ascii_case(hash) {
-        Ok(Some(bytes))
-    } else {
-        Ok(None)
-    }
 }
 
 pub fn stage_path(root: &Path, name: &str, hash: &str) -> Result<PathBuf> {

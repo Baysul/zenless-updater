@@ -2,19 +2,20 @@ use crate::{
     api::Api,
     cancelled,
     files::{
-        STATE, atomic_write, game_path, matches_file, metadata, open_existing, read_chunk,
-        safe_path, stage_path, sync_parent,
+        CHUNK_BUFFER, FileIdentity, STATE, atomic_write, game_path, identity, matches_chunk,
+        matches_file, metadata, open_existing, open_stage, safe_path, stage_path, sync_parent,
     },
-    manifest::{Category, Entry, Package, validate_entries},
+    manifest::{Asset, Category, Chunk, Entry, Package, validate_entries},
+    transfer::{self, Resources},
 };
 use anyhow::{Context, Result, ensure};
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs::{self, File, OpenOptions},
-    io::{BufRead, BufReader, Seek, SeekFrom, Write},
+    io::{BufRead, BufReader},
     path::{Path, PathBuf},
 };
 
@@ -308,9 +309,28 @@ pub struct Change {
     pub download_bytes: u64,
 }
 
+#[derive(Clone, Copy)]
+pub enum ChunkSource {
+    Stage,
+    Original(i64),
+    Network,
+}
+
+pub struct ChunkPlan {
+    pub source: ChunkSource,
+    pub old_offset: Option<i64>,
+}
+
+pub struct FilePlan {
+    pub entry: usize,
+    pub chunks: Vec<ChunkPlan>,
+    pub source_identity: Option<FileIdentity>,
+    pub stage_identity: Option<FileIdentity>,
+}
+
 pub struct Plan {
     pub entries: Vec<Entry>,
-    pub changed: Vec<usize>,
+    pub changed: Vec<FilePlan>,
     pub changes: Vec<Change>,
     pub download_bytes: u64,
     pub stage_bytes: u64,
@@ -331,51 +351,114 @@ pub fn progress(total: u64, message: &str, quiet: bool) -> ProgressBar {
     bar
 }
 
-pub fn scan(root: &Path, entries: Vec<Entry>, quiet: bool) -> Result<Plan> {
+fn locate_chunk(
+    stage: Option<&File>,
+    source: Option<&File>,
+    chunk: &Chunk,
+    old_offset: Option<i64>,
+    buffer: &mut [u8],
+) -> Result<ChunkSource> {
+    if matches_chunk(stage, chunk.offset, chunk.decoded_size, &chunk.hash, buffer)? {
+        Ok(ChunkSource::Stage)
+    } else if let Some(offset) = old_offset
+        && offset != chunk.offset
+        && matches_chunk(source, offset, chunk.decoded_size, &chunk.hash, buffer)?
+    {
+        Ok(ChunkSource::Original(offset))
+    } else if matches_chunk(
+        source,
+        chunk.offset,
+        chunk.decoded_size,
+        &chunk.hash,
+        buffer,
+    )? {
+        Ok(ChunkSource::Original(chunk.offset))
+    } else {
+        Ok(ChunkSource::Network)
+    }
+}
+
+pub fn scan(
+    root: &Path,
+    entries: Vec<Entry>,
+    installed: Option<&[Asset]>,
+    quiet: bool,
+) -> Result<Plan> {
+    let old_assets: HashMap<_, _> = installed
+        .unwrap_or_default()
+        .iter()
+        .map(|asset| (asset.name.as_str(), asset))
+        .collect();
     let bar = progress(entries.len() as u64, "Checking files", quiet);
-    let result: Result<Vec<Option<Change>>> = entries
+    let result: Result<Vec<Option<(FilePlan, Change)>>> = entries
         .par_iter()
-        .map(|entry| {
-            cancelled()?;
-            let asset = &entry.asset;
-            let path = game_path(root, &asset.name)?;
-            let complete = matches_file(&path, asset.size, &asset.hash)?;
-            let change = if complete {
-                None
-            } else {
-                let mut existing = open_existing(&path)?;
-                let missing = existing.is_none();
-                let mut stage = open_existing(&stage_path(root, &asset.name, &asset.hash)?)?;
-                let mut download_bytes = 0u64;
-                for chunk in &asset.chunks {
-                    if read_chunk(&mut stage, chunk.offset, chunk.decoded_size, &chunk.hash)?
-                        .is_none()
-                        && read_chunk(&mut existing, chunk.offset, chunk.decoded_size, &chunk.hash)?
-                            .is_none()
-                    {
-                        download_bytes +=
-                            u64::try_from(chunk.size).context("Negative chunk size")?;
+        .enumerate()
+        .map_init(
+            || vec![0u8; CHUNK_BUFFER],
+            |buffer, (index, entry)| {
+                cancelled()?;
+                let asset = &entry.asset;
+                let path = game_path(root, &asset.name)?;
+                let change = if matches_file(&path, asset.size, &asset.hash)? {
+                    None
+                } else {
+                    let existing = open_existing(&path)?;
+                    let stage = open_existing(&stage_path(root, &asset.name, &asset.hash)?)?;
+                    let source_identity = identity(existing.as_ref())?;
+                    let stage_identity = identity(stage.as_ref())?;
+                    let mut old_chunks = HashMap::new();
+                    if let Some(old) = old_assets.get(asset.name.as_str()) {
+                        for chunk in &old.chunks {
+                            old_chunks
+                                .entry((chunk.hash.to_ascii_lowercase(), chunk.decoded_size))
+                                .or_insert(chunk.offset);
+                        }
                     }
-                }
-                Some(Change {
-                    path: asset.name.clone(),
-                    missing,
-                    size: u64::try_from(asset.size).context("Negative file size")?,
-                    download_bytes,
-                })
-            };
-            bar.inc(1);
-            Ok(change)
-        })
+                    let mut chunks = Vec::with_capacity(asset.chunks.len());
+                    let mut download_bytes = 0u64;
+                    for chunk in &asset.chunks {
+                        let old_offset = old_chunks
+                            .get(&(chunk.hash.to_ascii_lowercase(), chunk.decoded_size))
+                            .copied();
+                        let source = locate_chunk(
+                            stage.as_ref(),
+                            existing.as_ref(),
+                            chunk,
+                            old_offset,
+                            buffer,
+                        )?;
+                        if matches!(source, ChunkSource::Network) {
+                            download_bytes +=
+                                u64::try_from(chunk.size).context("Negative chunk size")?;
+                        }
+                        chunks.push(ChunkPlan { source, old_offset });
+                    }
+                    Some((
+                        FilePlan {
+                            entry: index,
+                            chunks,
+                            source_identity,
+                            stage_identity,
+                        },
+                        Change {
+                            path: asset.name.clone(),
+                            missing: existing.is_none(),
+                            size: u64::try_from(asset.size).context("Negative file size")?,
+                            download_bytes,
+                        },
+                    ))
+                };
+                bar.inc(1);
+                Ok(change)
+            },
+        )
         .collect();
     bar.finish_and_clear();
     let mut changes = Vec::new();
-    let mut changed_indices = Vec::new();
-    for (index, change) in result?.into_iter().enumerate() {
-        if let Some(change) = change {
-            changed_indices.push(index);
-            changes.push(change);
-        }
+    let mut files = Vec::new();
+    for (file, change) in result?.into_iter().flatten() {
+        files.push(file);
+        changes.push(change);
     }
     Ok(Plan {
         download_bytes: changes.iter().map(|c| c.download_bytes).sum(),
@@ -386,7 +469,7 @@ pub fn scan(root: &Path, entries: Vec<Entry>, quiet: bool) -> Result<Plan> {
                 .context("Selected installation size overflow")
         })?,
         entries,
-        changed: changed_indices,
+        changed: files,
         changes,
     })
 }
@@ -409,51 +492,172 @@ pub fn lock(root: &Path) -> Result<File> {
     Ok(file)
 }
 
-fn stage_file(api: &Api, root: &Path, entry: &Entry) -> Result<()> {
+struct StagedFile<'a> {
+    entry: &'a Entry,
+    plan: &'a FilePlan,
+    path: PathBuf,
+    source: Option<File>,
+    stage: File,
+    fresh: bool,
+    source_unchanged: bool,
+    resume_unchanged: bool,
+}
+
+fn prepare_stage<'a>(root: &Path, entry: &'a Entry, plan: &'a FilePlan) -> Result<StagedFile<'a>> {
     let asset = &entry.asset;
-    let destination = game_path(root, &asset.name)?;
-    let path = stage_path(root, &asset.name, &asset.hash)?;
-    let mut source = open_existing(&destination)?;
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&path)?;
-    file.set_len(u64::try_from(asset.size).context("Negative file size")?)?;
-    let mut stage = Some(file);
-    for chunk in &asset.chunks {
-        cancelled()?;
-        if read_chunk(&mut stage, chunk.offset, chunk.decoded_size, &chunk.hash)?.is_some() {
-            continue;
-        }
-        let bytes = match read_chunk(&mut source, chunk.offset, chunk.decoded_size, &chunk.hash)? {
-            Some(bytes) => bytes,
-            None => api.bytes(
-                &entry.download,
-                &chunk.name,
-                u64::try_from(chunk.size).context("Negative chunk size")?,
-                u64::try_from(chunk.decoded_size).context("Negative decoded chunk size")?,
-                &chunk.hash,
-                &chunk.compressed_hash,
-            )?,
-        };
-        let file = stage.as_mut().context("Missing staging file")?;
-        file.seek(SeekFrom::Start(
-            u64::try_from(chunk.offset).context("Negative chunk offset")?,
-        ))?;
-        file.write_all(&bytes)?;
-    }
-    stage.as_ref().context("Missing staging file")?.sync_all()?;
     ensure!(
-        matches_file(&path, asset.size, &asset.hash)?,
+        asset.chunks.len() == plan.chunks.len(),
+        "Chunk plan length mismatch"
+    );
+    let source = open_existing(&game_path(root, &asset.name)?)?;
+    let source_unchanged = identity(source.as_ref())? == plan.source_identity;
+    let path = stage_path(root, &asset.name, &asset.hash)?;
+    let (stage, fresh) = open_stage(&path)?;
+    let resume_unchanged = !fresh && Some(FileIdentity::of(&stage)?) == plan.stage_identity;
+    let size = u64::try_from(asset.size).context("Negative file size")?;
+    if stage.metadata()?.len() != size {
+        stage.set_len(size)?;
+    }
+    Ok(StagedFile {
+        entry,
+        plan,
+        path,
+        source,
+        stage,
+        fresh,
+        source_unchanged,
+        resume_unchanged,
+    })
+}
+
+fn stage_chunk(
+    api: &Api,
+    file: &StagedFile<'_>,
+    index: usize,
+    resources: &Resources,
+    buffer: &mut [u8],
+) -> Result<()> {
+    cancelled()?;
+    let chunk = &file.entry.asset.chunks[index];
+    let planned = &file.plan.chunks[index];
+    if !file.fresh && (matches!(planned.source, ChunkSource::Stage) || !file.resume_unchanged) {
+        let _disk = resources.disk()?;
+        if matches_chunk(
+            Some(&file.stage),
+            chunk.offset,
+            chunk.decoded_size,
+            &chunk.hash,
+            buffer,
+        )? {
+            return Ok(());
+        }
+    }
+    if let Some(source) = &file.source
+        && !(matches!(planned.source, ChunkSource::Network) && file.source_unchanged)
+    {
+        let offset = match planned.source {
+            ChunkSource::Original(offset) => offset,
+            _ => planned.old_offset.unwrap_or(chunk.offset),
+        };
+        if transfer::copy_local(source, &file.stage, chunk, offset, resources, buffer)?
+            || (offset != chunk.offset
+                && transfer::copy_local(
+                    source,
+                    &file.stage,
+                    chunk,
+                    chunk.offset,
+                    resources,
+                    buffer,
+                )?)
+        {
+            return Ok(());
+        }
+    }
+    api.stream_chunk(&file.entry.download, chunk, &file.stage, resources, buffer)
+}
+
+fn finish_stage(file: &StagedFile<'_>, resources: &Resources) -> Result<FileIdentity> {
+    cancelled()?;
+    let _disk = resources.disk()?;
+    let current = open_existing(&file.path)?.context("Staging file disappeared")?;
+    ensure!(
+        FileIdentity::of(&file.stage)?.same_file(FileIdentity::of(&current)?),
+        "Staging file replaced while downloading"
+    );
+    if let Some(source) = &file.source {
+        file.stage
+            .set_permissions(source.metadata()?.permissions())?;
+    }
+    file.stage.sync_all()?;
+    let asset = &file.entry.asset;
+    ensure!(
+        matches_file(&file.path, asset.size, &asset.hash)?,
         "Final file checksum mismatch: {}",
         asset.name
     );
-    if let Some(source) = source {
-        fs::set_permissions(&path, source.metadata()?.permissions())?;
-    }
-    Ok(())
+    FileIdentity::of(&file.stage)
+}
+
+fn stage_all(
+    api: &Api,
+    root: &Path,
+    plan: &Plan,
+    quiet: bool,
+) -> Result<HashMap<usize, FileIdentity>> {
+    let workers = rayon::current_num_threads().max(1);
+    let resources = Resources::new(workers);
+    let bar = progress(plan.stage_bytes, "Staging verified data", quiet);
+    bar.set_style(
+        ProgressStyle::with_template(
+            "{msg} [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} {bytes_per_sec} ETA {eta}",
+        )
+        .expect("static progress template"),
+    );
+    let result = (|| -> Result<HashMap<usize, FileIdentity>> {
+        let mut verified = HashMap::new();
+        let mut ordered: Vec<_> = plan.changed.iter().collect();
+        // Large files supply enough work immediately, rather than leaving a
+        // serial multi-GiB tail when smaller files finish.
+        ordered.sort_by_key(|file| std::cmp::Reverse(plan.entries[file.entry].asset.size));
+        // Bound descriptors and admitted files independently of chunk count.
+        // Parallel ranges are lazy: no unbounded per-chunk task queue is built.
+        for batch in ordered.chunks(workers) {
+            cancelled()?;
+            let active: Vec<_> = batch
+                .iter()
+                .map(|file| prepare_stage(root, &plan.entries[file.entry], file))
+                .collect::<Result<_>>()?;
+            active
+                .par_iter()
+                .flat_map(|file| {
+                    (0..file.entry.asset.chunks.len())
+                        .into_par_iter()
+                        .map(move |index| (file, index))
+                })
+                .try_for_each_init(
+                    || vec![0u8; CHUNK_BUFFER],
+                    |buffer, (file, index)| {
+                        stage_chunk(api, file, index, &resources, buffer).with_context(|| {
+                            format!(
+                                "Staging {} chunk {index} (rerun the command to resume)",
+                                file.entry.asset.name
+                            )
+                        })?;
+                        bar.inc(u64::try_from(file.entry.asset.chunks[index].decoded_size)?);
+                        Ok::<_, anyhow::Error>(())
+                    },
+                )?;
+            let finished: Vec<_> = active
+                .par_iter()
+                .map(|file| Ok((file.plan.entry, finish_stage(file, &resources)?)))
+                .collect::<Result<_>>()?;
+            verified.extend(finished);
+            // All producers and chunk jobs are joined before these files close.
+        }
+        Ok(verified)
+    })();
+    bar.finish_and_clear();
+    result
 }
 
 pub fn apply(api: &Api, root: &Path, plan: &Plan, version: &str, quiet: bool) -> Result<()> {
@@ -464,31 +668,31 @@ pub fn apply(api: &Api, root: &Path, plan: &Plan, version: &str, quiet: bool) ->
         "Insufficient free space: need {} staged bytes plus 64 MiB; have {available}",
         plan.stage_bytes
     );
-    let bar = progress(plan.changed.len() as u64, "Staging verified files", quiet);
-    let staged: Result<Vec<()>> = plan
-        .changed
-        .par_iter()
-        .map(|&index| {
-            let entry = &plan.entries[index];
-            stage_file(api, root, entry).with_context(|| {
-                format!("Staging {} (rerun the command to resume)", entry.asset.name)
-            })?;
-            bar.inc(1);
-            Ok(())
-        })
-        .collect();
-    bar.finish_and_clear();
-    staged?;
+    let staged = stage_all(api, root, plan, quiet)?;
     cancelled()?;
     // Detect a release change before committing any of the staged game files.
     ensure!(
         api.latest()?.0.tag == version,
         "Official release changed while downloading; rerun the command"
     );
+    // Reject stages modified after their joined whole-file verification before
+    // ANY destination is replaced. Planned identities are never checksum proof.
+    for file in &plan.changed {
+        let asset = &plan.entries[file.entry].asset;
+        let stage = open_existing(&stage_path(root, &asset.name, &asset.hash)?)?;
+        let expected = *staged
+            .get(&file.entry)
+            .context("Missing staged verification")?;
+        ensure!(
+            identity(stage.as_ref())? == Some(expected),
+            "Staged file changed after verification: {}; rerun the command",
+            asset.name
+        );
+    }
     // Every replacement is checksum-verified before ANY destination is replaced.
-    for &index in &plan.changed {
+    for file in &plan.changed {
         cancelled()?;
-        let asset = &plan.entries[index].asset;
+        let asset = &plan.entries[file.entry].asset;
         let source = stage_path(root, &asset.name, &asset.hash)?;
         let destination = game_path(root, &asset.name)?;
         fs::create_dir_all(destination.parent().context("No destination directory")?)?;
