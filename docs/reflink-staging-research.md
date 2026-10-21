@@ -2,9 +2,9 @@
 
 ## Scope and conclusion
 
-Two evidence layers: primary-source documentation/current-source inspection, followed by **isolated local measurements on 2026-10-21** recorded below. No production application source, tests, configuration, dependencies or game files were changed. Disposable benchmark files/helper were removed afterward. Repository content was treated as data, not instructions. `docs/upstream-performance-research.md` supplies historical context; its implementation follow-up supersedes its original execution map. Line references below describe the inspected working tree.
+Two original evidence layers: primary-source documentation/source inspection, followed by **isolated local measurements on 2026-10-21** recorded below. During that research, no production application source, tests, configuration, dependencies or game files were changed; disposable benchmark files/helper were removed afterward. Repository content was treated as data, not instructions. The [implementation follow-up](#implementation-follow-up) records the subsequently implemented optimization and real-updater checks. `docs/upstream-performance-research.md` supplies historical context. Line references in the research sections describe the pre-reflink working tree; the follow-up identifies current symbols instead.
 
-**Recommendation:** a guarded `FICLONE` fast path is worth considering for fresh stages of existing files with substantial expected **same-offset** reuse, but not as a universal speed optimization. Clone into an exclusively created, empty stage **before resizing**, hash target chunks in that stage, and leave matching ranges unwritten. Keep verified copy/download fallback. Measurements establish large reductions in application writes and shared extent duplication, but only conditional staging-time improvements—not a whole-update speedup. Cloning followed by today's unconditional local copies loses the sharing benefit.
+**Recommendation:** a guarded `FICLONE` fast path is worth considering for fresh stages of existing files with substantial expected **same-offset** reuse, but not as a universal speed optimization. Clone into an exclusively created, empty stage **before resizing**, hash target chunks in that stage, and leave matching ranges unwritten. Keep verified copy/download fallback. Measurements establish large reductions in application writes and shared extent duplication, but only conditional staging-time improvements—not a whole-update speedup. Cloning without bypassing matching local copies loses the sharing benefit.
 
 ## What the interfaces actually promise
 
@@ -23,7 +23,7 @@ Two evidence layers: primary-source documentation/current-source inspection, fol
 - **NOCOW/checksums:** btrfs documents compatible source/destination NOCOW and checksum status as a reflink prerequisite; the inspected kernel explicitly rejects mismatched `NODATASUM` with `EINVAL`. A fresh stage inherits its directory/mount policy, which may differ from the original. Compression requires CoW and checksums; `nodatacow` implies `nodatasum` and disables compression. Prefer ordinary-copy fallback over changing the original's flags, mount options, or integrity policy. Even compatible NOCOW files require CoW when writing shared storage. [B1], [B2], [B3], [M1], [K3:795–849]
 - **Space:** sharing saves initial data duplication, not writable capacity. Cloning consumes metadata; overwritten/shared blocks need new storage and extent/checksum bookkeeping, potentially at coarser granularity than changed bytes. Clone, writes, or final sync may fail with space/quota/I/O errors. Keep `src/updater.rs:664–670`'s full staging-size plus **64 MiB** conservative admission check initially; it is not an ENOSPC guarantee on btrfs. Do not subtract shared bytes or promise compression savings without a separate accounting design. `fallocate` can unshare blocks, defeating sharing savings; defragmentation can also break reflinks. Sharing is not an independent physical backup against damage to shared blocks. [M1], [M4], [B3], [B4]
 
-## Minimal seam in the current updater (proposal, not implementation)
+## Original integration proposal
 
 1. **Creation/seeding:** `src/files.rs:44–59` already distinguishes exclusive `create_new(true)` success from resumed stages. In `src/updater.rs:506–531` (`prepare_stage`), attempt a small Linux-only descriptor-based clone helper **only for a genuinely fresh stage with an original source**, before `set_len`. Preserve existing resumable content: never clone over a resumed stage. Return an explicit seeded/empty outcome alongside freshness; successful seeding must not imply verified content. Unsupported platforms/filesystems keep the existing path.
 2. **Verify and do not rewrite:** `src/updater.rs:533–576` (`stage_chunk`) currently skips stage hashing for fresh files; `src/transfer.rs:135–174` (`copy_local`) hashes **while writing every copied byte**. Therefore enabling clone alone still dirties reusable ranges. For a cloned stage, first run `matches_chunk(stage, target_offset, decoded_size, target_hash, buffer)` under existing disk admission for **each target chunk**, regardless of its scan source decision, and return without writing only on a match. `src/files.rs:62–91` already provides that bounded, positioned MD5 check. A scan identity or successful ioctl is never hash proof.
@@ -122,9 +122,47 @@ Keep the small descriptor-based seam, explicit cloned-vs-empty state, clone-befo
 
 The previous **87.79 s** isolated real update repaired **174 missing files**, not changed existing ones. Those files had no originals to reflink: this optimization would not have improved that measured workload.
 
+## Implementation follow-up
+
+The guarded whole-file clone path is now implemented:
+
+- `files::try_reflink` uses the Linux `libc::FICLONE` binding with open descriptors, not a subprocess or a handwritten ioctl number. The readable original and exclusively created read/write stage must be distinct regular files; the stage must be empty and singly linked. The caller's existing open modes are retained. Non-Linux builds return unavailable without invoking a clone.
+- `updater::should_reflink` counts only planned original chunks whose source and target offsets match. The source identity must still match the scan. The initial gate requires at least **1 MiB** of expected same-offset reuse and at least **half of `max(source_size, target_size)`**. This is a conservative policy, **not a benchmark-selected optimum**. Missing sources, low reuse and moved-only reuse use the normal assembly path.
+- `prepare_stage` distinguishes empty, cloned and resumed contents. Only a fresh stage can be cloned; cloning happens before target-length adjustment. A resumed stage is never overwritten by cloning, even if its original has changed.
+- `stage_chunk` hashes **every target chunk of a cloned stage** under existing disk admission. A match returns without writing. A mismatch keeps the existing verified copy from the separately opened original (including old offsets) and download fallback. Neither cloning nor a scan identity counts as checksum verification.
+- `EOPNOTSUPP`, `ENOTTY`, `EXDEV` and validated whole-file `EINVAL` use the normal path after resetting the same owned stage descriptor to zero. The normal target-length adjustment follows. The first unsupported-clone reason is reported to stderr; further fallback notices in that process are suppressed. Failed reset, interruption, space/quota/I/O errors, invalid descriptors, permissions and other unclassified clone failures abort.
+- Permissions, stage sync, complete-file MD5, source/stage identity checks, release revalidation, per-file atomic rename, destination-parent sync, final selected-installation verification and metadata-last publication are unchanged. The full staging-size plus **64 MiB** space requirement is not discounted for sharing. Trusted-directory and crash/rename limitations above are unchanged.
+
+### Real updater checks
+
+Built the release binary and used `repair -y -j 8` against a private btrfs reflink copy of the installation, **never the installed game directory**. The official installed release was **3.3.0**, with **20 selected manifests**, **en-us** voices and **11,576 checked files**. No test source or fixtures were added.
+
+The affected asset was `ZenlessZoneZero_Data/StreamingAssets/Audio/Windows/Full/Streamed_SFX_12.pck`: **191,393,175 bytes**, **163 chunks**, official MD5 **`b97148f4e0e0a40ab451835e5a0204c0`**. Removing its last byte left a non-block-aligned **191,393,174-byte** original, exercising clone-before-growth as well as repair of the last target chunk.
+
+| Private-copy scenario | Observed result |
+|---|---|
+| Fresh clone; one truncated file | Repair succeeded; downloaded **609.37 KiB**; exact target length and official MD5 restored. `filefrag` reported **7 shared extents**, with only the repaired tail extent unshared. |
+| Unsupported clone; identical truncation, but NOCOW inheritance on the empty private staging directory | Reported `Invalid argument (os error 22)`, then repair succeeded through verified copy/download fallback. Official length/MD5 restored; **0 shared extents** in the published file. No installed file flags or mount policies were changed. |
+| Existing complete stage; original truncated | Repair succeeded with **0 B** downloaded. The pre-existing stage inode **54405703** became the published file inode, with the official length/MD5. The stage's valid tail was not replaced with the truncated original. |
+| Missing sources alongside the first fresh-clone repair | The first run also restored **174 pre-existing missing files** through normal downloads; its total download estimate was **772.59 MiB**. All selected files were verified before completion. This run is not a comparable one-file timing sample. |
+
+All four updater runs exited **0**, published verified files, and left no staged files behind. The sampled installed original's inode/device, size, mtime/ctime, permissions and MD5 were unchanged afterward. All private-copy artifacts were removed after inspection.
+
+For transparency, GNU `time -v` reported the following **single-run, process-wide** observations after the missing files had been repaired:
+
+| Scenario | End-to-end elapsed | Filesystem-output counter (`ru_oublock`) | Peak RSS (KiB) |
+|---|---:|---:|---:|
+| Fresh clone | 55.81 s | 46,792 | 124,856 |
+| Unsupported-clone fallback | 54.39 s | 419,520 | 125,340 |
+| Existing complete stage | 54.98 s | 45,328 | 127,144 |
+
+These counters include metadata and every other write in the command; they are **not application `pwrite` counts, measured compressed storage sizes or a staging-only benchmark**. The clone retained sharing and had far fewer reported output blocks, but **these runs do not establish an end-to-end speedup**: full scans dominate, caches/host activity were uncontrolled, and the fallback deliberately had different staging inheritance. `strace` was unavailable and unprivileged `perf trace` was denied, so no syscall-count claim is made.
+
+`cargo fmt --check`, `cargo clippy --offline --all-targets -- -D warnings`, `cargo test --offline --locked` and `cargo build --release --offline --locked` passed. The existing test suite contains **0 tests**. Only the available **Linux x86_64** target was built. Error handling for simulated space/quota/I/O failures, interrupted clone/publication, hostile writers, and moved-layout cloning was not dynamically exercised; the preceding research is not a substitute for those checks. A regression test ensuring that an existing resume stage is never cloned over would be valuable, but none was added without approval.
+
 ## Remaining limits / evidence status
 
-Measured results are limited to the labeled same-size, same-offset synthetic staging workloads above. Moved/new/missing data still needs assembly, and all existing full-integrity passes remain. Kernel/filesystem versions, destination inheritance, quotas, nested mounts/subvolumes, fragmentation and concurrent writers remain correctness/portability limits. The proposal preserves the manifest's existing MD5 checks, not stronger authenticity or collision resistance; MD5 is unsuitable where collision resistance is required. [R1] Timing observations are not a promised end-to-end update speedup.
+The original staging measurements are limited to the labeled same-size, same-offset synthetic workloads above; the follow-up adds the explicitly described real-updater checks. Moved/new/missing data still needs assembly, and all existing full-integrity passes remain. Kernel/filesystem versions, destination inheritance, quotas, nested mounts/subvolumes, fragmentation and concurrent writers remain correctness/portability limits. This optimization preserves the manifest's existing MD5 checks, not stronger authenticity or collision resistance; MD5 is unsuitable where collision resistance is required. [R1] Timing observations are not a promised end-to-end update speedup.
 
 ## Primary sources
 

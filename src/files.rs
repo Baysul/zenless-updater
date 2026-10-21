@@ -58,6 +58,58 @@ pub fn open_stage(path: &Path) -> Result<(File, bool)> {
     }
 }
 
+/// Seed an exclusively created, empty read/write stage from a readable original.
+/// A clone is not checksum proof. An unsupported clone leaves the stage empty;
+/// all other errors abort, including a failed reset after a speculative clone.
+#[cfg(target_os = "linux")]
+pub fn try_reflink(source: &File, stage: &File) -> Result<bool> {
+    use std::{io, os::fd::AsRawFd, sync::Once};
+
+    static NOTICE: Once = Once::new();
+
+    cancelled()?;
+    let source_meta = source.metadata()?;
+    let stage_meta = stage.metadata()?;
+    ensure!(
+        source_meta.is_file()
+            && stage_meta.is_file()
+            && stage_meta.len() == 0
+            && stage_meta.nlink() == 1
+            && (source_meta.dev() != stage_meta.dev() || source_meta.ino() != stage_meta.ino()),
+        "Reflink requires distinct regular files and a new empty stage"
+    );
+    // SAFETY: both descriptors are live for the call. FICLONE takes the readable
+    // source descriptor as an integer, not a pointer; only the writable stage
+    // is modified. The platform binding supplies the architecture's ioctl code.
+    if unsafe { libc::ioctl(stage.as_raw_fd(), libc::FICLONE, source.as_raw_fd()) } >= 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    cancelled()?;
+    if !matches!(
+        error.raw_os_error(),
+        Some(libc::EOPNOTSUPP | libc::ENOTTY | libc::EXDEV | libc::EINVAL)
+    ) {
+        return Err(error).context("Cloning staged file");
+    }
+    // Even an unsuccessful clone can have changed extents. Never leave its
+    // speculative contents behind or allow them to masquerade as resumed data.
+    stage
+        .set_len(0)
+        .context("Resetting unsupported reflink stage")?;
+    NOTICE.call_once(|| {
+        eprintln!(
+            "Reflink unavailable ({error}); using verified copies. Further fallback notices are suppressed."
+        );
+    });
+    Ok(false)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn try_reflink(_source: &File, _stage: &File) -> Result<bool> {
+    Ok(false)
+}
+
 /// Verify a range without allocating a complete decoded chunk or moving a shared cursor.
 pub fn matches_chunk(
     file: Option<&File>,

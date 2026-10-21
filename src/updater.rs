@@ -4,6 +4,7 @@ use crate::{
     files::{
         CHUNK_BUFFER, FileIdentity, STATE, atomic_write, game_path, identity, matches_chunk,
         matches_file, metadata, open_existing, open_stage, safe_path, stage_path, sync_parent,
+        try_reflink,
     },
     manifest::{Asset, Category, Chunk, Entry, Package, validate_entries},
     transfer::{self, Resources},
@@ -492,15 +493,43 @@ pub fn lock(root: &Path) -> Result<File> {
     Ok(file)
 }
 
+enum StageContents {
+    Empty,
+    Cloned,
+    Resumed { unchanged: bool },
+}
+
 struct StagedFile<'a> {
     entry: &'a Entry,
     plan: &'a FilePlan,
     path: PathBuf,
     source: Option<File>,
     stage: File,
-    fresh: bool,
+    contents: StageContents,
     source_unchanged: bool,
-    resume_unchanged: bool,
+}
+
+fn should_reflink(entry: &Entry, plan: &FilePlan, source_size: u64) -> Result<bool> {
+    let reusable =
+        entry
+            .asset
+            .chunks
+            .iter()
+            .zip(&plan.chunks)
+            .try_fold(0u64, |bytes, (chunk, planned)| {
+                if matches!(planned.source, ChunkSource::Original(offset) if offset == chunk.offset)
+                {
+                    bytes
+                        .checked_add(u64::try_from(chunk.decoded_size)?)
+                        .context("Reusable chunk size overflow")
+                } else {
+                    Ok(bytes)
+                }
+            })?;
+    let clone_size = source_size.max(u64::try_from(entry.asset.size)?);
+    // A conservative starting policy, not a measured optimum: amortize clone
+    // setup, and avoid seeding mostly overwritten or immediately discarded data.
+    Ok(reusable >= 1024 * 1024 && reusable >= clone_size.div_ceil(2))
 }
 
 fn prepare_stage<'a>(root: &Path, entry: &'a Entry, plan: &'a FilePlan) -> Result<StagedFile<'a>> {
@@ -513,7 +542,22 @@ fn prepare_stage<'a>(root: &Path, entry: &'a Entry, plan: &'a FilePlan) -> Resul
     let source_unchanged = identity(source.as_ref())? == plan.source_identity;
     let path = stage_path(root, &asset.name, &asset.hash)?;
     let (stage, fresh) = open_stage(&path)?;
-    let resume_unchanged = !fresh && Some(FileIdentity::of(&stage)?) == plan.stage_identity;
+    let contents = if !fresh {
+        StageContents::Resumed {
+            unchanged: Some(FileIdentity::of(&stage)?) == plan.stage_identity,
+        }
+    } else if let Some(source) = &source
+        && source_unchanged
+        && should_reflink(entry, plan, source.metadata()?.len())?
+        && try_reflink(source, &stage)
+            .with_context(|| format!("Preparing reflink stage for {}", asset.name))?
+    {
+        StageContents::Cloned
+    } else {
+        StageContents::Empty
+    };
+    // Clone the empty stage before sizing it: an unaligned source EOF can make
+    // FICLONE fail if the destination was already extended beyond that EOF.
     let size = u64::try_from(asset.size).context("Negative file size")?;
     if stage.metadata()?.len() != size {
         stage.set_len(size)?;
@@ -524,9 +568,8 @@ fn prepare_stage<'a>(root: &Path, entry: &'a Entry, plan: &'a FilePlan) -> Resul
         path,
         source,
         stage,
-        fresh,
+        contents,
         source_unchanged,
-        resume_unchanged,
     })
 }
 
@@ -540,7 +583,15 @@ fn stage_chunk(
     cancelled()?;
     let chunk = &file.entry.asset.chunks[index];
     let planned = &file.plan.chunks[index];
-    if !file.fresh && (matches!(planned.source, ChunkSource::Stage) || !file.resume_unchanged) {
+    let check_stage = match file.contents {
+        StageContents::Empty => false,
+        // A clone is unverified: hash every target range before leaving it alone.
+        StageContents::Cloned => true,
+        StageContents::Resumed { unchanged } => {
+            !unchanged || matches!(planned.source, ChunkSource::Stage)
+        }
+    };
+    if check_stage {
         let _disk = resources.disk()?;
         if matches_chunk(
             Some(&file.stage),

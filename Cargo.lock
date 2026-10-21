@@ -1840,6 +1840,7 @@ dependencies = [
  "ctrlc",
  "fs2",
  "indicatif",
+ "libc",
  "md5",
  "prost",
  "rayon",

@@ -43,10 +43,11 @@ To use a different folder, add `-d`:
 ```
 
 - Chunks run in parallel even within one large file. Active staging files are bounded by `-j`; writes use independent offsets rather than a shared file cursor.
-- The scan retains reusable-chunk decisions. New staging files skip pointless resume reads; existing stages are checked before reuse.
+- The scan retains reusable-chunk decisions. New empty stages skip pointless resume reads; existing stages are checked before reuse.
+- On supported Linux filesystems, fresh stages with substantial same-position reuse share the original's data instead of copying it. Matching chunks are verified without rewriting them. Unsupported clones fall back to verified copies; existing resumable stages are never cloned over.
 - Downloads stream through recycled 64 KiB buffers, incremental checksums and bounded decompression instead of allocating complete compressed and decoded chunks. Network, processing, disk and transfer-memory admission are separate; application transfer memory is budgeted at 128 MiB (not a total process-RSS limit).
 - Updates/repairs save optional installed-layout hints in `.zenless-updater/manifests/`. Old layouts let unchanged chunks be copied from their previous offsets. Missing/corrupt caches or unavailable old releases fall back to target-offset checks and downloads.
 
 `check` remains read-only and always performs full integrity checks. Every reused/downloaded chunk is verified; complete staged files and the final selected installation are still checked before launcher metadata is published. Cache records never prove local integrity.
 
-See [upstream research and implementation notes](docs/upstream-performance-research.md) for design rationale and verification results.
+See [upstream research and implementation notes](docs/upstream-performance-research.md) and [reflink findings and implementation checks](docs/reflink-staging-research.md#implementation-follow-up) for design rationale and verification results.
