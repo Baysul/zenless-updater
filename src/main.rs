@@ -3,7 +3,7 @@ mod files;
 mod manifest;
 mod updater;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 use std::{
@@ -19,7 +19,7 @@ static CANCELLED: AtomicBool = AtomicBool::new(false);
 pub(crate) fn cancelled() -> Result<()> {
     ensure!(
         !CANCELLED.load(Ordering::Relaxed),
-        "Interrupted; rerun update to resume staged downloads"
+        "Interrupted; rerun the command to resume staged downloads"
     );
     Ok(())
 }
@@ -28,7 +28,7 @@ pub(crate) fn cancelled() -> Result<()> {
 #[command(
     version,
     about = "Update or repair an existing Global Zenless Zone Zero installation using official Sophon chunks.",
-    after_help = "No command means check. Check never changes game files; exit 2 means an update/repair is needed.\nDefault game directory: $HOME/Games/Zenless"
+    after_help = "No command means check. Check never changes game files; exit 2 means an update or repair is needed.\n`repair` restores the installed release in place, including damaged launcher metadata; `update` moves to a new release.\nDefault game directory: $HOME/Games/Zenless"
 )]
 struct Args {
     #[arg(short = 'd', long, global = true, value_name = "DIR")]
@@ -59,14 +59,22 @@ enum Command {
         #[arg(short = 'y', long)]
         yes: bool,
     },
+    /// Restore damaged or missing files and rebuild launcher metadata
+    Repair {
+        /// Accept the displayed repair plan without prompting
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
 }
 
 #[derive(Serialize)]
 struct Report<'a> {
     game_dir: &'a Path,
-    installed_version: &'a str,
+    installed_version: Option<&'a str>,
     latest_version: &'a str,
     needs_update: bool,
+    metadata_problems: &'a [String],
+    restored_groups: &'a [updater::Group],
     selected_manifests: usize,
     voice_packs: Vec<&'a str>,
     files_checked: usize,
@@ -93,6 +101,23 @@ impl Report<'_> {
             human_size(self.download_bytes),
             human_size(self.staging_bytes)
         );
+        if !self.metadata_problems.is_empty() {
+            eprintln!("Local metadata to rebuild:");
+            for problem in self.metadata_problems {
+                eprintln!("  {problem}");
+            }
+        }
+        if !self.restored_groups.is_empty() {
+            eprintln!("Installed resource groups missing from disk:");
+            for group in self.restored_groups {
+                eprintln!(
+                    "  {} ({} files, {})",
+                    group.name,
+                    group.files,
+                    human_size(group.bytes)
+                );
+            }
+        }
         for change in self.changes.iter().take(12) {
             eprintln!(
                 "  {} {} ({})",
@@ -124,11 +149,22 @@ fn main() -> ExitCode {
 fn run() -> Result<u8> {
     let args = Args::parse();
     let update = matches!(args.command, Some(Command::Update { .. }));
-    ensure!(!args.json || !update, "--json is only supported with check");
-    let root = game_directory(args.game_dir)?;
-    let installed = read_installed_version(&root)?;
+    let repair = matches!(args.command, Some(Command::Repair { .. }));
+    let modifies = update || repair;
+    ensure!(
+        !args.json || !modifies,
+        "--json is only supported with check"
+    );
+    let root = game_directory(args.game_dir.clone())?;
+    let local = inspect_installation(&root, update)?;
+    if repair {
+        ensure!(
+            local.global_evidence,
+            "Cannot confirm a Global Windows installation: config.ini and version_info are both missing; restore at least one of them"
+        );
+    }
     ctrlc::set_handler(|| CANCELLED.store(true, Ordering::Relaxed))?;
-    let _lock = if update {
+    let _lock = if modifies {
         ensure_game_closed()?;
         Some(updater::lock(&root)?)
     } else {
@@ -142,42 +178,25 @@ fn run() -> Result<u8> {
         eprintln!("Fetching official Global release metadata…");
     }
     let (branch, build) = api.latest()?;
-    let packages = updater::select_packages(
-        &root,
-        build.manifests,
-        &branch.categories,
-        args.full,
-        &args.voice,
-    )?;
+    let (packages, entries, restored) =
+        load_entries(&pool, &api, &root, build, &branch.categories, &args, repair)?;
     let voice_packs: Vec<_> = packages
         .iter()
         .filter(|p| ["en-us", "ja-jp", "ko-kr", "zh-cn"].contains(&p.matching_field.as_str()))
         .map(|p| p.matching_field.as_str())
         .collect();
-    if !args.json {
-        eprintln!(
-            "Installed: {installed}  Latest: {}  Selected manifests: {}",
-            branch.tag,
-            packages.len()
-        );
-        eprintln!(
-            "Voice packs: {}",
-            if voice_packs.is_empty() {
-                "none detected (use --voice to add one)".to_owned()
-            } else {
-                voice_packs.join(", ")
-            }
-        );
-        eprintln!("Loading manifests, then verifying local files and reusable chunks…");
-    }
-    let entries = pool.install(|| api.entries(&packages))?;
+    announce(args.json, &local, &branch.tag, packages.len(), &voice_packs);
     let plan = pool.install(|| updater::scan(&root, entries, args.json))?;
-    let needs_update = installed != branch.tag || !plan.changed.is_empty();
+    let needs_update = local.version.as_deref() != Some(branch.tag.as_str())
+        || !plan.changed.is_empty()
+        || !local.problems.is_empty();
     let report = Report {
         game_dir: &root,
-        installed_version: &installed,
+        installed_version: local.version.as_deref(),
         latest_version: &branch.tag,
         needs_update,
+        metadata_problems: &local.problems,
+        restored_groups: &restored,
         selected_manifests: packages.len(),
         voice_packs,
         files_checked: plan.entries.len(),
@@ -189,7 +208,7 @@ fn run() -> Result<u8> {
         changes: &plan.changes,
     };
     report.print(args.json)?;
-    if !update {
+    if !modifies {
         if !args.json {
             eprintln!(
                 "{} No game files changed.",
@@ -203,21 +222,104 @@ fn run() -> Result<u8> {
         return Ok(if needs_update { 2 } else { 0 });
     }
     if !needs_update {
-        eprintln!("Up to date; no changes needed.");
+        if repair {
+            eprintln!(
+                "Nothing to repair; the installation already matches {}.",
+                branch.tag
+            );
+        } else {
+            eprintln!("Up to date; no changes needed.");
+        }
         return Ok(0);
     }
-    let yes = matches!(args.command, Some(Command::Update { yes: true }));
-    if !confirm_update(yes)? {
+    let yes = matches!(
+        args.command,
+        Some(Command::Update { yes: true } | Command::Repair { yes: true })
+    );
+    commit(&api, &pool, &root, &plan, &branch.tag, repair, yes)?;
+    Ok(0)
+}
+
+fn announce(json: bool, local: &LocalState, tag: &str, manifests: usize, voice_packs: &[&str]) {
+    if json {
+        return;
+    }
+    eprintln!(
+        "Installed: {}  Latest: {tag}  Selected manifests: {manifests}",
+        local.version.as_deref().unwrap_or("unknown")
+    );
+    eprintln!(
+        "Voice packs: {}",
+        if voice_packs.is_empty() {
+            "none detected (use --voice to add one)".to_owned()
+        } else {
+            voice_packs.join(", ")
+        }
+    );
+    eprintln!("Loading manifests, then verifying local files and reusable chunks…");
+}
+
+fn commit(
+    api: &api::Api,
+    pool: &rayon::ThreadPool,
+    root: &Path,
+    plan: &updater::Plan,
+    tag: &str,
+    repair: bool,
+    yes: bool,
+) -> Result<()> {
+    if !confirm_update(yes, repair)? {
         eprintln!("Cancelled.");
-        return Ok(0);
+        return Ok(());
     }
     ensure_game_closed()?;
-    pool.install(|| updater::apply(&api, &root, &plan, &branch.tag, false))?;
-    eprintln!(
-        "Updated and verified {}. Launch the game with your existing Wine/Proton setup.",
-        branch.tag
-    );
-    Ok(0)
+    pool.install(|| updater::apply(api, root, plan, tag, false))?;
+    if repair {
+        eprintln!(
+            "Repaired and verified {} files for {tag}. Launch the game with your existing Wine/Proton setup.",
+            plan.entries.len()
+        );
+    } else {
+        eprintln!(
+            "Updated and verified {tag}. Launch the game with your existing Wine/Proton setup."
+        );
+    }
+    Ok(())
+}
+
+fn load_entries(
+    pool: &rayon::ThreadPool,
+    api: &api::Api,
+    root: &Path,
+    build: api::Build,
+    categories: &[manifest::Category],
+    args: &Args,
+    repair: bool,
+) -> Result<(
+    Vec<manifest::Package>,
+    Vec<manifest::Entry>,
+    Vec<updater::Group>,
+)> {
+    if repair {
+        let recorded = updater::recorded_files(root)?;
+        let manifests = pool.install(|| api.grouped_entries(&build.manifests))?;
+        let selection = pool.install(|| {
+            updater::select_repair(
+                root,
+                manifests,
+                categories,
+                args.full,
+                &args.voice,
+                recorded.as_ref(),
+            )
+        })?;
+        Ok((selection.packages, selection.entries, selection.restored))
+    } else {
+        let packages =
+            updater::select_packages(root, build.manifests, categories, args.full, &args.voice)?;
+        let entries = pool.install(|| api.entries(&packages))?;
+        Ok((packages, entries, Vec::new()))
+    }
 }
 
 fn game_directory(directory: Option<PathBuf>) -> Result<PathBuf> {
@@ -232,40 +334,118 @@ fn game_directory(directory: Option<PathBuf>) -> Result<PathBuf> {
         .with_context(|| format!("Opening game directory {}", directory.display()))
 }
 
-fn read_installed_version(root: &Path) -> Result<String> {
+struct LocalState {
+    version: Option<String>,
+    problems: Vec<String>,
+    global_evidence: bool,
+}
+
+// `strict` keeps the historical update preconditions. Repair inspects the same files
+// without failing on damage, because rebuilding that metadata is part of its job.
+fn inspect_installation(root: &Path, strict: bool) -> Result<LocalState> {
+    let exe = files::metadata(&files::game_path(root, "ZenlessZoneZero.exe")?)?.is_some();
     ensure!(
-        files::metadata(&files::game_path(root, "ZenlessZoneZero.exe")?)?.is_some(),
+        exe || (!strict && looks_like_installation(root)?),
         "Not an existing ZZZ installation: {}",
         root.display()
     );
-    let config = fs::read_to_string(files::game_path(root, "config.ini")?)
-        .context("Reading game config.ini")?;
-    let installed = config_value(&config, "game_version")
-        .context("config.ini has no [General] game_version")?;
-    let channel =
-        config_value(&config, "channel").context("config.ini has no [General] channel")?;
-    let sub_channel = config_value(&config, "sub_channel").unwrap_or("0");
-    ensure!(
-        channel == "1" && sub_channel == "0",
-        "Only the official Global channel (1/0) is supported; refusing to mix game distributions"
-    );
-    let version_path = files::game_path(root, "version_info")?;
-    if files::metadata(&version_path)?.is_some() {
-        let version = fs::read_to_string(version_path)?;
-        ensure!(
-            version.starts_with("OSPRODWin"),
-            "Only Global Windows game files are supported"
-        );
+    let mut problems = Vec::new();
+    if !exe {
+        problems.push("ZenlessZoneZero.exe is missing".to_owned());
     }
-    Ok(installed.to_owned())
+    let config = read_text(&files::game_path(root, "config.ini")?)?;
+    let version_file = read_text(&files::game_path(root, "version_info")?)?;
+    let mut version = None;
+    let mut global_evidence = false;
+    let mut config_global = false;
+    if let Some(config) = &config {
+        global_evidence = config
+            .lines()
+            .any(|line| line.trim().eq_ignore_ascii_case("[General]"));
+        match (
+            config_value(config, "channel"),
+            config_value(config, "sub_channel"),
+        ) {
+            (Some("1"), Some("0") | None) => config_global = true,
+            (Some(_), _) => bail!(
+                "Only the official Global channel (1/0) is supported; refusing to mix game distributions"
+            ),
+            (None, _) if strict => {
+                bail!("config.ini has no [General] channel; run repair to rebuild it")
+            }
+            (None, _) => problems.push("config.ini has no [General] channel".to_owned()),
+        }
+        match config_value(config, "game_version") {
+            Some(value) => version = Some(value.to_owned()),
+            None if strict => {
+                bail!("config.ini has no [General] game_version; run repair to rebuild it")
+            }
+            None => problems.push("config.ini has no [General] game_version".to_owned()),
+        }
+    } else if strict {
+        bail!("config.ini is missing; run repair to rebuild it");
+    } else {
+        problems.push("config.ini is missing".to_owned());
+    }
+    match version_file.as_deref() {
+        Some(text) if text.starts_with("OSPRODWin") => {
+            global_evidence = true;
+            if version.is_none() {
+                let tag = text.trim_start_matches("OSPRODWin").trim();
+                if !tag.is_empty() {
+                    version = Some(tag.to_owned());
+                }
+            }
+        }
+        Some(_) => {
+            ensure!(
+                config_global,
+                "Only Global Windows game files are supported"
+            );
+            problems.push("version_info is damaged".to_owned());
+        }
+        None if strict => {}
+        None => problems.push("version_info is missing".to_owned()),
+    }
+    if !strict && files::metadata(&files::game_path(root, "pkg_version")?)?.is_none() {
+        problems.push("pkg_version is missing".to_owned());
+    }
+    Ok(LocalState {
+        version,
+        problems,
+        global_evidence,
+    })
 }
 
-fn confirm_update(yes: bool) -> Result<bool> {
+fn looks_like_installation(root: &Path) -> Result<bool> {
+    for name in [
+        "version_info",
+        "pkg_version",
+        "config.ini",
+        "file_category_launcher",
+    ] {
+        if files::metadata(&files::game_path(root, name)?)?.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(files::game_path(root, "ZenlessZoneZero_Data")?.is_dir())
+}
+
+fn read_text(path: &Path) -> Result<Option<String>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(String::from_utf8_lossy(&bytes).into_owned())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("Reading {}", path.display())),
+    }
+}
+
+fn confirm_update(yes: bool, repair: bool) -> Result<bool> {
     if yes {
         return Ok(true);
     }
     eprint!(
-        "Replace these official game files? Listed modded files will be overwritten; unrelated files are kept. [y/N] "
+        "{} these official game files? Listed modded files will be overwritten; unrelated files are kept. [y/N] ",
+        if repair { "Repair" } else { "Replace" }
     );
     io::stderr().flush()?;
     let mut response = String::new();
@@ -321,7 +501,7 @@ fn ensure_game_closed() -> Result<()> {
         if let Ok(name) = fs::read_to_string(process.path().join("comm")) {
             ensure!(
                 !name.to_ascii_lowercase().starts_with("zenlesszonezero"),
-                "Close Zenless Zone Zero before updating"
+                "Close Zenless Zone Zero before changing game files"
             );
         }
     }

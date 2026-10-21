@@ -180,46 +180,56 @@ impl Api {
             .with_context(|| format!("Downloading {name} after 3 attempts"))
     }
 
-    pub fn entries(&self, packages: &[Package]) -> Result<Vec<Entry>> {
+    fn package_entries(&self, package: &Package) -> Result<Vec<Entry>> {
+        let meta = &package.manifest;
+        ensure!(
+            meta.id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_'),
+            "Invalid manifest ID"
+        );
+        let compressed = meta.compressed_size.parse::<u64>()?;
+        let uncompressed = meta.uncompressed_size.parse::<u64>()?;
+        ensure!(
+            compressed <= 64 * 1024 * 1024 && uncompressed <= 128 * 1024 * 1024,
+            "Manifest exceeds safety limit"
+        );
+        let bytes = self.bytes(
+            &package.manifest_download,
+            &meta.id,
+            compressed,
+            uncompressed,
+            &meta.checksum,
+            "",
+        )?;
+        let manifest = Manifest::decode(bytes.as_slice()).context("Invalid Sophon protobuf")?;
+        Ok(manifest
+            .assets
+            .into_iter()
+            .filter(|asset| !["config.ini", "pkg_version"].contains(&asset.name.as_str()))
+            .map(|asset| Entry {
+                asset,
+                download: package.chunk_download.clone(),
+            })
+            .collect())
+    }
+
+    /// Download every manifest, keeping each package association for repair selection.
+    pub fn grouped_entries(&self, packages: &[Package]) -> Result<Vec<(Package, Vec<Entry>)>> {
         use rayon::prelude::*;
         let groups: Result<Vec<Vec<Entry>>> = packages
             .par_iter()
-            .map(|package| {
-                let meta = &package.manifest;
-                ensure!(
-                    meta.id
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b == b'_'),
-                    "Invalid manifest ID"
-                );
-                let compressed = meta.compressed_size.parse::<u64>()?;
-                let uncompressed = meta.uncompressed_size.parse::<u64>()?;
-                ensure!(
-                    compressed <= 64 * 1024 * 1024 && uncompressed <= 128 * 1024 * 1024,
-                    "Manifest exceeds safety limit"
-                );
-                let bytes = self.bytes(
-                    &package.manifest_download,
-                    &meta.id,
-                    compressed,
-                    uncompressed,
-                    &meta.checksum,
-                    "",
-                )?;
-                let manifest =
-                    Manifest::decode(bytes.as_slice()).context("Invalid Sophon protobuf")?;
-                Ok(manifest
-                    .assets
-                    .into_iter()
-                    .filter(|asset| !["config.ini", "pkg_version"].contains(&asset.name.as_str()))
-                    .map(|asset| Entry {
-                        asset,
-                        download: package.chunk_download.clone(),
-                    })
-                    .collect())
-            })
+            .map(|package| self.package_entries(package))
             .collect();
-        let mut entries: Vec<_> = groups?.into_iter().flatten().collect();
+        Ok(packages.iter().cloned().zip(groups?).collect())
+    }
+
+    pub fn entries(&self, packages: &[Package]) -> Result<Vec<Entry>> {
+        let mut entries: Vec<_> = self
+            .grouped_entries(packages)?
+            .into_iter()
+            .flat_map(|(_, entries)| entries)
+            .collect();
         validate_entries(&mut entries)?;
         Ok(entries)
     }
