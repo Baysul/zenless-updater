@@ -1,53 +1,64 @@
 # zenless-updater
 
-Updates an existing Zenless Zone Zero folder on Linux. It downloads only the files that changed.
+Update or repair Zenless Zone Zero on Linux without downloading the whole game again. It reuses game data you already have and downloads only what's needed.
 
-## Requirements
+## What you need
 
-- The game already installed (Global version, Windows install)
-- Rust and a C compiler
+- An existing Windows installation of the Global version of the game
+- Rust and a C compiler to build the updater
 
 ## Build
+
+Run this from the project folder:
 
 ```sh
 cargo build --release --locked
 ```
 
-## Use
+## Update your game
 
-The default game folder is `~/Games/Zenless`. Close the game before running any command.
+Close the game first. By default, the updater looks in `~/Games/Zenless`.
+
+Check your game files and see how much needs to be downloaded, without changing anything:
 
 ```sh
-# Show what would be downloaded. Changes nothing.
 ./target/release/zenless-updater
+```
 
-# Download and install the update.
+Download and install the update:
+
+```sh
 ./target/release/zenless-updater update
+```
 
-# Replace missing or broken game files.
+The updater shows a summary and asks for confirmation before making changes. If interrupted, run the same command again to resume.
+
+To fix missing or damaged files without moving to a newer game version:
+
+```sh
 ./target/release/zenless-updater repair
 ```
 
-To use a different folder, add `-d`:
+## Use a different game folder
+
+Add `-d` and the path to your game folder:
 
 ```sh
-./target/release/zenless-updater -d /path/to/Zenless check
+./target/release/zenless-updater -d "/path/to/Zenless" update
 ```
 
-## Performance
+## Adjust the speed
 
-`-j` controls parallel checks and chunk transfers (1–32, default 4). For a fast SSD and connection, try:
+The updater handles up to 4 file checks or downloads at a time. If you have a fast drive and internet connection, try increasing this to 8:
 
 ```sh
 ./target/release/zenless-updater -j 8 update
 ```
 
-- Chunks run in parallel even within one large file. Active staging files are bounded by `-j`; writes use independent offsets rather than a shared file cursor.
-- The scan retains reusable-chunk decisions. New empty stages skip pointless resume reads; existing stages are checked before reuse.
-- On supported Linux filesystems, fresh stages with substantial same-position reuse share the original's data instead of copying it. Matching chunks are verified without rewriting them. Unsupported clones fall back to verified copies; existing resumable stages are never cloned over.
-- Downloads stream through recycled 64 KiB buffers, incremental checksums and bounded decompression instead of allocating complete compressed and decoded chunks. Network, processing, disk and transfer-memory admission are separate; application transfer memory is budgeted at 128 MiB (not a total process-RSS limit).
-- Updates/repairs save optional installed-layout hints in `.zenless-updater/manifests/`. Old layouts let unchanged chunks be copied from their previous offsets. Missing/corrupt caches or unavailable old releases fall back to target-offset checks and downloads.
+You can choose a value from 1 to 32. Higher isn't always faster.
 
-`check` remains read-only and always performs full integrity checks. Every reused/downloaded chunk is verified; complete staged files and the final selected installation are still checked before launcher metadata is published. Cache records never prove local integrity.
+For all available options:
 
-See [upstream research and implementation notes](docs/upstream-performance-research.md) and [reflink findings and implementation checks](docs/reflink-staging-research.md#implementation-follow-up) for design rationale and verification results.
+```sh
+./target/release/zenless-updater --help
+```
