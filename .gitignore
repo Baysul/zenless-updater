@@ -1,5 +1,8 @@
 /target/
 /.pi/
+/docs/
+/patches/
+/tools/
 *.exe
 wine-src/
 hkp-test/
