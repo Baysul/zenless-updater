@@ -5,7 +5,18 @@ Update or repair Zenless Zone Zero on Linux without downloading the whole game a
 ## What you need
 
 - An existing Windows installation of the Global version of the game
-- Rust and a C compiler to build the updater
+- Rust and a C compiler, only if you build the updater yourself
+
+## Download
+
+Each release has a ready-made build for x86_64 and aarch64 Linux. Download the archive for your machine, check it against `SHA256SUMS`, and unpack it:
+
+```sh
+sha256sum --check --ignore-missing SHA256SUMS
+tar xf zenless-updater-*-x86_64-unknown-linux-musl.tar.gz
+```
+
+The `zenless-updater` program inside works on any Linux distribution. Run it in place of `./target/release/zenless-updater` in the commands below.
 
 ## Build
 
