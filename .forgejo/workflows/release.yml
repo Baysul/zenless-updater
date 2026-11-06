@@ -1,4 +1,4 @@
-# Pushing a v* tag builds static Linux binaries and publishes a Forgejo release for that tag with them attached.
+# Pushing a v* tag builds Linux binaries and publishes a Forgejo release for that tag with them attached.
 # A manual run builds the same archives and keeps them as workflow artifacts. GitHub runs
 # .github/workflows/release.yml instead.
 name: release
@@ -15,16 +15,22 @@ jobs:
     timeout-minutes: 45
     strategy:
       fail-fast: false
+      # x86_64 jobs and publish run on lullaby's runner (Ubuntu 26.04); aarch64 jobs on the existing arm64 runner.
       matrix:
         include:
-          - { target: x86_64-unknown-linux-musl, runner: ubuntu-24.04-amd64 }
+          # Static, for any distro.
+          - { target: x86_64-unknown-linux-musl, runner: ubuntu-26.04-amd64 }
           - { target: aarch64-unknown-linux-musl, runner: ubuntu-24.04-arm64 }
+          # Linked against the system's glibc, for distros with glibc 2.38 or newer.
+          - { target: x86_64-unknown-linux-gnu, runner: ubuntu-26.04-amd64 }
+          - { target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm64 }
     env:
       NAME: zenless-updater-${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || github.sha }}-${{ matrix.target }}
     steps:
       - uses: https://code.forgejo.org/actions/checkout@v4
-      # A musl C compiler for aws-lc and zstd, so the binary links statically and runs on any distro.
-      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      # A musl C compiler for aws-lc, zstd and mimalloc, so the musl binary links statically.
+      - if: endsWith(matrix.target, '-musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
       - uses: https://github.com/actions-rust-lang/setup-rust-toolchain@v1
         with:
           target: ${{ matrix.target }}
@@ -45,7 +51,7 @@ jobs:
     name: publish release
     needs: build
     if: startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       contents: write
     steps:

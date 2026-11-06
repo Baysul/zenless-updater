@@ -1,4 +1,4 @@
-# Pushing a v* tag builds static Linux binaries and publishes a GitHub release for that tag with them attached.
+# Pushing a v* tag builds Linux binaries and publishes a GitHub release for that tag with them attached.
 # A manual run builds the same archives and keeps them as workflow artifacts. Forgejo runs
 # .forgejo/workflows/release.yml instead.
 name: release
@@ -20,14 +20,19 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { target: x86_64-unknown-linux-musl, runner: ubuntu-24.04 }
-          - { target: aarch64-unknown-linux-musl, runner: ubuntu-24.04-arm }
+          # Static, for any distro.
+          - { target: x86_64-unknown-linux-musl, runner: ubuntu-26.04 }
+          - { target: aarch64-unknown-linux-musl, runner: ubuntu-26.04-arm }
+          # Linked against the system's glibc, for distros with glibc 2.38 or newer.
+          - { target: x86_64-unknown-linux-gnu, runner: ubuntu-26.04 }
+          - { target: aarch64-unknown-linux-gnu, runner: ubuntu-26.04-arm }
     env:
       NAME: zenless-updater-${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || github.sha }}-${{ matrix.target }}
     steps:
       - uses: actions/checkout@v4
-      # A musl C compiler for aws-lc and zstd, so the binary links statically and runs on any distro.
-      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      # A musl C compiler for aws-lc, zstd and mimalloc, so the musl binary links statically.
+      - if: endsWith(matrix.target, '-musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           target: ${{ matrix.target }}
@@ -47,7 +52,7 @@ jobs:
     name: publish release
     needs: build
     if: startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       contents: write
     steps:

@@ -16,6 +16,11 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
+// musl's allocator slows down badly when the parallel checks and downloads allocate from many threads at once.
+#[cfg(target_env = "musl")]
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 static CANCELLED: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn cancelled() -> Result<()> {
