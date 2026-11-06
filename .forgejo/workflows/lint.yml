@@ -11,7 +11,8 @@ on:
 jobs:
   lint:
     name: fmt, clippy, test
-    runs-on: ubuntu-26.04
+    # The lullaby runner: Ubuntu 26.04, x86_64.
+    runs-on: lullaby
     timeout-minutes: 30
     steps:
       - uses: https://code.forgejo.org/actions/checkout@v4
